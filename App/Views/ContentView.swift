@@ -117,7 +117,31 @@ struct ContentView: View {
             .padding(.horizontal, 2)
         }
         .padding(.vertical, 6)
-        .background(Material.thick)
+        .background {
+            if #available(macOS 26, *) {
+                Rectangle().fill(Material.thick)
+            } else {
+                VisualEffectView(material: .menu, blendingMode: .behindWindow)
+            }
+        }
+    }
+}
+
+private struct VisualEffectView: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+    let blendingMode: NSVisualEffectView.BlendingMode
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = .active
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {
+        view.material = material
+        view.blendingMode = blendingMode
     }
 }
 
