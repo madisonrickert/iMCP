@@ -561,33 +561,72 @@ actor NetworkDiscoveryManager {
     private let serviceDomain: String
     var listener: NWListener
     private let browser: NWBrowser
+    private let pathMonitor = NWPathMonitor()
+
+    // All Network.framework callbacks run on this dedicated queue rather than
+    // `.main`. A stalled SwiftUI main thread must never be able to freeze
+    // advertisement or recovery — that is the "process alive at 0% CPU but not
+    // advertising" wedge this whole subsystem now guards against.
+    private let queue = DispatchQueue(label: "co.dododo.iMCP.network")
+
+    // Whether our own advertised service is currently visible via Bonjour.
+    // The listener can self-report `.ready` while mDNSResponder has silently
+    // dropped the record (e.g. after sleep/wake); a listener-state check alone
+    // cannot see that, but the browser can.
+    private var ownServiceVisible = false
+
+    // The service advertises under the stock (device-derived) Bonjour instance
+    // name, so we learn the concrete registered name from the listener's
+    // service-registration updates and use it to recognize our own record in
+    // browser results.
+    private var advertisedServiceName: String?
+    private var latestBrowseResults: Set<NWBrowser.Result> = []
+
+    // Invoked when the network path becomes satisfied again (sleep/wake,
+    // network change) — a common trigger for a dropped Bonjour registration.
+    private var onPathSatisfied: (@Sendable () -> Void)?
 
     init(serviceType: String, serviceDomain: String) throws {
         self.serviceType = serviceType
         self.serviceDomain = serviceDomain
 
-        // Local-only Bonjour advertisement.
+        self.listener = try Self.makeListener(
+            serviceType: serviceType,
+            serviceDomain: serviceDomain
+        )
+
+        // Browser confirms our own advertisement is actually discoverable.
+        self.browser = NWBrowser(
+            for: .bonjour(type: serviceType, domain: serviceDomain),
+            using: Self.makeParameters()
+        )
+
+        log.info("Network discovery manager initialized with Bonjour service type: \(serviceType)")
+    }
+
+    private static func makeParameters() -> NWParameters {
         let parameters = NWParameters.tcp
         parameters.acceptLocalOnly = true
         parameters.includePeerToPeer = false
-
         if let tcpOptions = parameters.defaultProtocolStack.internetProtocol
             as? NWProtocolIP.Options
         {
             tcpOptions.version = .v4
         }
+        return parameters
+    }
 
-        // Listen and advertise via Bonjour.
-        self.listener = try NWListener(using: parameters)
-        self.listener.service = NWListener.Service(type: serviceType, domain: serviceDomain)
+    private static func makeListener(
+        serviceType: String,
+        serviceDomain: String
+    ) throws -> NWListener {
+        let listener = try NWListener(using: makeParameters())
+        listener.service = NWListener.Service(type: serviceType, domain: serviceDomain)
+        return listener
+    }
 
-        // Browser is used for monitoring and diagnostics.
-        self.browser = NWBrowser(
-            for: .bonjour(type: serviceType, domain: serviceDomain),
-            using: parameters
-        )
-
-        log.info("Network discovery manager initialized with Bonjour service type: \(serviceType)")
+    func setOnPathSatisfied(_ handler: @escaping @Sendable () -> Void) {
+        self.onPathSatisfied = handler
     }
 
     func start(
@@ -595,52 +634,105 @@ actor NetworkDiscoveryManager {
         connectionHandler: @escaping @Sendable (NWConnection) -> Void
     ) {
         listener.stateUpdateHandler = stateHandler
-
         listener.newConnectionHandler = connectionHandler
+        // Track the concrete instance name mDNSResponder registers for us, so
+        // we can tell our own record apart in browser results.
+        listener.serviceRegistrationUpdateHandler = { [weak self] change in
+            Task { await self?.handleRegistrationChange(change) }
+        }
+        listener.start(queue: queue)
 
-        listener.start(queue: .main)
-        browser.start(queue: .main)
+        // Consume browser results (previously created but never read) to track
+        // whether our service is genuinely being advertised.
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            Task { await self?.updateBrowseResults(results) }
+        }
+        browser.start(queue: queue)
 
-        log.info("Started network discovery and advertisement")
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            Task { await self?.firePathSatisfied() }
+        }
+        pathMonitor.start(queue: queue)
+
+        log.info("Started network discovery and advertisement on dedicated queue")
     }
+
+    func currentListenerState() -> NWListener.State { listener.state }
+
+    func isOwnServiceVisible() -> Bool { ownServiceVisible }
+
+    private func handleRegistrationChange(_ change: NWListener.ServiceRegistrationChange) {
+        switch change {
+        case .add(let endpoint):
+            if case .service(let name, _, _, _) = endpoint {
+                advertisedServiceName = name
+            }
+        case .remove(let endpoint):
+            if case .service(let name, _, _, _) = endpoint, name == advertisedServiceName {
+                advertisedServiceName = nil
+            }
+        @unknown default:
+            break
+        }
+        recomputeOwnServiceVisibility()
+    }
+
+    private func updateBrowseResults(_ results: Set<NWBrowser.Result>) {
+        latestBrowseResults = results
+        recomputeOwnServiceVisibility()
+    }
+
+    // The browser only browses our service type + domain, so matching the
+    // registered instance name is enough to identify our own advertisement.
+    private func recomputeOwnServiceVisibility() {
+        guard let advertisedServiceName else {
+            ownServiceVisible = false
+            return
+        }
+        ownServiceVisible = latestBrowseResults.contains { result in
+            if case .service(let name, _, _, _) = result.endpoint {
+                return name == advertisedServiceName
+            }
+            return false
+        }
+    }
+
+    private func firePathSatisfied() { onPathSatisfied?() }
 
     func stop() {
         listener.cancel()
         browser.cancel()
+        pathMonitor.cancel()
         log.info("Stopped network discovery and advertisement")
     }
 
+    // Re-create ONLY the listener on a fresh ephemeral port and re-advertise.
+    // Connections already vended to newConnectionHandler are independent and
+    // are intentionally left running, so re-registering never drops a live
+    // MCP session — the persistent session keeps its iMCP connection across a
+    // self-heal.
     func restartWithRandomPort() async throws {
+        let currentStateHandler = listener.stateUpdateHandler
+        let currentConnectionHandler = listener.newConnectionHandler
+        let currentRegistrationHandler = listener.serviceRegistrationUpdateHandler
+
         listener.cancel()
 
-        // Recreate listener on an ephemeral port.
-        let parameters: NWParameters = NWParameters.tcp  // Explicit type
-        parameters.acceptLocalOnly = true
-        parameters.includePeerToPeer = false
-
-        if let tcpOptions = parameters.defaultProtocolStack.internetProtocol
-            as? NWProtocolIP.Options
-        {
-            tcpOptions.version = .v4
-        }
-
-        let newListener: NWListener = try NWListener(using: parameters)
-        let service = NWListener.Service(type: self.serviceType, domain: self.serviceDomain)
-        newListener.service = service
-
-        if let currentStateHandler = listener.stateUpdateHandler {
-            newListener.stateUpdateHandler = currentStateHandler
-        }
-
-        if let currentConnectionHandler = listener.newConnectionHandler {
-            newListener.newConnectionHandler = currentConnectionHandler
-        }
-
-        newListener.start(queue: .main)
+        let newListener = try Self.makeListener(
+            serviceType: serviceType,
+            serviceDomain: serviceDomain
+        )
+        newListener.stateUpdateHandler = currentStateHandler
+        newListener.newConnectionHandler = currentConnectionHandler
+        newListener.serviceRegistrationUpdateHandler = currentRegistrationHandler
+        newListener.start(queue: queue)
 
         self.listener = newListener
+        advertisedServiceName = nil  // re-learned from the new registration
+        ownServiceVisible = false  // re-confirmed by the browser within ~1-2s
 
-        log.notice("Restarted listener with a dynamic port")
+        log.notice("Re-registered Bonjour advertisement with a fresh listener")
     }
 }
 
@@ -658,6 +750,9 @@ actor ServerNetworkManager {
 
     private let services = ServiceRegistry.services
     private var serviceBindings: [String: Binding<Bool>] = [:]
+
+    // Debounce counter for the advertisement health monitor.
+    private var consecutiveUnhealthyChecks = 0
 
     init() {
         do {
@@ -680,12 +775,26 @@ actor ServerNetworkManager {
     }
 
     func start() async {
+        // Guard against re-entry: a second start() would spawn a duplicate
+        // health-monitor loop and re-wire handlers.
+        guard !isRunningState else {
+            log.info("Network manager already running")
+            return
+        }
+
         log.info("Starting network manager")
         isRunningState = true
 
         guard let discoveryManager = discoveryManager else {
             log.error("Cannot start network manager: discovery manager not initialized")
             return
+        }
+
+        // A network-path transition (sleep/wake, network change) is a strong
+        // hint the Bonjour registration may have been dropped — verify and heal.
+        await discoveryManager.setOnPathSatisfied { [weak self] in
+            guard let self else { return }
+            Task { await self.checkAndHealAdvertisement(reason: "path-satisfied") }
         }
 
         await discoveryManager.start(
@@ -705,41 +814,75 @@ actor ServerNetworkManager {
             }
         )
 
-        // Monitor listener health and auto-restart if it stops advertising.
+        // Health monitor: verify the advertisement is genuinely live — not just
+        // that the listener object self-reports `.ready`.
         Task {
             while self.isRunningState {
-                if let currentDM = self.discoveryManager,
-                    self.isRunningState
-                {
-                    let listenerState: NWListener.State = await currentDM.listener.state
-
-                    if listenerState != .ready {
-                        log.warning(
-                            "Listener not in ready state, current state: \\(listenerState)"
-                        )
-
-                        let shouldAttemptRestart: Bool
-                        switch listenerState {
-                        case .failed, .cancelled:
-                            shouldAttemptRestart = true
-                        default:
-                            shouldAttemptRestart = false
-                        }
-
-                        if shouldAttemptRestart {
-                            log.info(
-                                "Attempting to restart listener (state: \\(listenerState)) because it was failed or cancelled."
-                            )
-                            try? await currentDM.restartWithRandomPort()
-                        }
-                    }
-                }
-
+                await self.checkAndHealAdvertisement(reason: "monitor")
                 try? await Task.sleep(nanoseconds: 10_000_000_000)  // 10s
             }
         }
     }
 
+    // Single recovery path for advertisement health. Re-registers the listener
+    // when it is definitively dead (.failed/.cancelled), stuck non-ready, or
+    // self-reports `.ready` while the browser cannot see our service. The
+    // re-register preserves all live connections (see restartWithRandomPort).
+    private func checkAndHealAdvertisement(reason: String) async {
+        guard isRunningState, let dm = discoveryManager else { return }
+
+        let state = await dm.currentListenerState()
+        let visible = await dm.isOwnServiceVisible()
+
+        let definitelyDead: Bool
+        let healthy: Bool
+        switch state {
+        case .ready:
+            definitelyDead = false
+            healthy = visible  // ready AND actually discoverable
+        case .failed, .cancelled:
+            definitelyDead = true
+            healthy = false
+        default:  // .setup, .waiting, and any future states
+            definitelyDead = false
+            healthy = false
+        }
+
+        if healthy {
+            consecutiveUnhealthyChecks = 0
+            return
+        }
+
+        consecutiveUnhealthyChecks += 1
+        let strikes = consecutiveUnhealthyChecks
+        let stateText = String(describing: state)
+        log.warning(
+            "Advertisement unhealthy (reason: \(reason), state: \(stateText), visible: \(visible), strike \(strikes))"
+        )
+
+        // Act immediately on a definitively dead listener or a path transition;
+        // otherwise require sustained unhealthiness so a single transient
+        // browser/listener blip never churns Bonjour. Re-register is itself
+        // connection-safe, so the bar is about avoiding needless re-advertise.
+        let softThreshold = 3
+        guard definitelyDead || reason == "path-satisfied" || consecutiveUnhealthyChecks >= softThreshold
+        else { return }
+
+        let liveConnections = connections.count
+        log.notice(
+            "Re-registering Bonjour advertisement (reason: \(reason)); \(liveConnections) live MCP connection(s) preserved"
+        )
+        do {
+            try await dm.restartWithRandomPort()
+            consecutiveUnhealthyChecks = 0
+        } catch {
+            log.error("Failed to re-register advertisement: \(error.localizedDescription)")
+        }
+    }
+
+    // Observe-only. Recovery is centralized in `checkAndHealAdvertisement`
+    // (driven by the 10s monitor + path-satisfied events) so there is exactly
+    // one re-registration driver and no racing restarts.
     private func handleListenerStateChange(_ state: NWListener.State) async {
         switch state {
         case .ready:
@@ -747,30 +890,11 @@ actor ServerNetworkManager {
         case .setup:
             log.debug("Server setting up...")
         case .waiting(let error):
-            log.warning("Server waiting: \(error)")
-
-            // If the port is already in use, try a new one.
-            if error.errorCode == 48 {
-                log.error("Port already in use, will try to restart service")
-
-                try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2 seconds
-
-                if isRunningState {
-                    try? await discoveryManager?.restartWithRandomPort()
-                }
-            }
+            log.warning("Server waiting: \(error) — monitor will re-register if it persists")
         case .failed(let error):
-            log.error("Server failed: \(error)")
-
-            // Attempt recovery after a brief delay.
-            if isRunningState {
-                log.info("Attempting to recover from server failure")
-                try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1 second
-
-                try? await discoveryManager?.restartWithRandomPort()
-            }
+            log.error("Server failed: \(error) — monitor will re-register")
         case .cancelled:
-            log.info("Server cancelled")
+            log.info("Server listener cancelled")
         @unknown default:
             log.warning("Unknown server state")
         }
