@@ -754,6 +754,27 @@ actor ServerNetworkManager {
     // Debounce counter for the advertisement health monitor.
     private var consecutiveUnhealthyChecks = 0
 
+    // --- Bounded, non-reentrant re-registration self-heal state ---
+    //
+    // The crash this guards against: `checkAndHealAdvertisement` suspends across
+    // `await dm.restartWithRandomPort()`, and this actor is reentrant — a 10s
+    // monitor tick or a burst of `path-satisfied` callbacks can run a second
+    // heal during that suspension. Unbounded, those nest cancel/recreate cycles
+    // on the shared network queue until the Network framework recurses past the
+    // stack guard (the SIGBUS stack overflow). These three vars + the pure
+    // `SelfHeal.decide` gate make the re-register critical section bounded and
+    // non-reentrant.
+
+    // True while a restartWithRandomPort() is in flight. Caps in-flight heals at 1.
+    private var isReregistering = false
+    // Wall-clock time of the last re-registration attempt; enforces the cooldown.
+    private var lastReregisterAt: Date?
+    // Consecutive attempts that have NOT restored health; drives backoff. Reset
+    // only on a healthy check — not on a mere restart success, since a restart
+    // does not prove the service became browser-visible. Cooldown/backoff math
+    // lives in `SelfHeal` (SelfHealDecision.swift) so it is unit-tested.
+    private var reregisterAttempts = 0
+
     init() {
         do {
             self.discoveryManager = try NetworkDiscoveryManager(
@@ -826,8 +847,10 @@ actor ServerNetworkManager {
 
     // Single recovery path for advertisement health. Re-registers the listener
     // when it is definitively dead (.failed/.cancelled), stuck non-ready, or
-    // self-reports `.ready` while the browser cannot see our service. The
-    // re-register preserves all live connections (see restartWithRandomPort).
+    // self-reports `.ready` while the browser cannot see our service — but only
+    // through the bounded, non-reentrant gate (`SelfHeal.decide`, unit-tested in
+    // SelfHealDecision.swift). The re-register preserves all live connections
+    // (see restartWithRandomPort).
     private func checkAndHealAdvertisement(reason: String) async {
         guard isRunningState, let dm = discoveryManager else { return }
 
@@ -850,6 +873,7 @@ actor ServerNetworkManager {
 
         if healthy {
             consecutiveUnhealthyChecks = 0
+            reregisterAttempts = 0  // a healthy check clears the backoff ladder
             return
         }
 
@@ -860,23 +884,59 @@ actor ServerNetworkManager {
             "Advertisement unhealthy (reason: \(reason), state: \(stateText), visible: \(visible), strike \(strikes))"
         )
 
-        // Act immediately on a definitively dead listener or a path transition;
-        // otherwise require sustained unhealthiness so a single transient
-        // browser/listener blip never churns Bonjour. Re-register is itself
-        // connection-safe, so the bar is about avoiding needless re-advertise.
-        let softThreshold = 3
-        guard definitelyDead || reason == "path-satisfied" || consecutiveUnhealthyChecks >= softThreshold
-        else { return }
-
-        let liveConnections = connections.count
-        log.notice(
-            "Re-registering Bonjour advertisement (reason: \(reason)); \(liveConnections) live MCP connection(s) preserved"
+        let now = Date()
+        let priorAttempts = reregisterAttempts
+        let decision = SelfHeal.decide(
+            healthy: healthy,
+            definitelyDead: definitelyDead,
+            strikes: strikes,
+            softThreshold: 3,
+            bypassThreshold: reason == "path-satisfied",
+            isReregistering: isReregistering,
+            now: now,
+            lastReregisterAt: lastReregisterAt,
+            priorAttempts: priorAttempts
         )
-        do {
-            try await dm.restartWithRandomPort()
-            consecutiveUnhealthyChecks = 0
-        } catch {
-            log.error("Failed to re-register advertisement: \(error.localizedDescription)")
+
+        switch decision {
+        case .skipHealthy, .skipBelowThreshold:
+            return
+        case .skipInFlight:
+            log.debug("Skipping re-register (reason: \(reason)): one already in flight")
+            return
+        case .skipCooldown(let remaining):
+            let remainingText = String(format: "%.0f", remaining)
+            log.notice(
+                "Cooldown skip (reason: \(reason)): \(remainingText)s remaining (attempts: \(priorAttempts))"
+            )
+            return
+        case .reregister(let attemptNumber, let escalated):
+            if escalated {
+                log.error(
+                    "Bonjour advertisement still unhealthy after \(priorAttempts) re-registrations (reason: \(reason), state: \(stateText)) — backing off"
+                )
+            }
+            // Claim the critical section BEFORE the await. No suspension point
+            // between SelfHeal.decide and these writes, so the read-modify-write
+            // is atomic on the actor — a concurrent monitor / path-satisfied tick
+            // sees isReregistering == true and skips.
+            isReregistering = true
+            lastReregisterAt = now
+            reregisterAttempts = attemptNumber
+            defer { isReregistering = false }
+
+            let liveConnections = connections.count
+            log.notice(
+                "Re-registering Bonjour advertisement (reason: \(reason), attempt \(attemptNumber)); \(liveConnections) live MCP connection(s) preserved"
+            )
+            do {
+                try await dm.restartWithRandomPort()
+                consecutiveUnhealthyChecks = 0
+                // reregisterAttempts is intentionally NOT reset here — only a
+                // subsequent healthy check proves the service became visible.
+            } catch {
+                log.error("Failed to re-register advertisement: \(error.localizedDescription)")
+            }
         }
     }
 
